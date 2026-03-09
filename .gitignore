@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pdf
+manga_pages/
+.DS_Store
+.wdm/

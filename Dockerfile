@@ -1,0 +1,39 @@
+# ── Base image ────────────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+# ── System deps required by Chrome ────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget gnupg ca-certificates \
+    fonts-liberation libappindicator3-1 libasound2 libatk-bridge2.0-0 \
+    libatk1.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 \
+    libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+    libpangocairo-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 \
+    libxcursor1 libxdamage1 libxext6 libxfixes3 libxi6 libxkbcommon0 \
+    libxrandr2 libxrender1 libxss1 libxtst6 xdg-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Install Google Chrome stable ──────────────────────────────────────────────
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python dependencies ───────────────────────────────────────────────────────
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── App source ────────────────────────────────────────────────────────────────
+COPY . .
+
+# ── Runtime config ────────────────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1
+# Suppress webdriver-manager download logs
+ENV WDM_LOG=0
+# Cache ChromeDriver in /tmp (writable in any container)
+ENV WDM_CACHE_PATH=/tmp/.wdm
+
+EXPOSE 8080
+
+# 1 process · 8 threads · 10-min timeout (scraping can be slow)
+CMD ["gunicorn", "--workers", "1", "--threads", "8", "--timeout", "600", "--bind", "0.0.0.0:8080", "app:app"]

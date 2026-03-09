@@ -1,0 +1,6 @@
+flask
+gunicorn
+selenium
+webdriver-manager
+Pillow
+requests
