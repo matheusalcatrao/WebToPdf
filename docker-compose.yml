@@ -1,0 +1,14 @@
+services:
+  webtopdf:
+    build: .
+    platform: linux/amd64
+    ports:
+      - "5001:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WDM_LOG=0
+      - WDM_CACHE_PATH=/tmp/.wdm
+    # /tmp is used for ChromeDriver cache and generated PDFs
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
