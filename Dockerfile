@@ -40,4 +40,4 @@ ENV WDM_CACHE_PATH=/tmp/.wdm
 EXPOSE 8080
 
 # 1 process · 8 threads · 10-min timeout (scraping can be slow)
-CMD ["gunicorn", "--workers", "1", "--threads", "8", "--timeout", "600", "--bind", "0.0.0.0:8080", "app:app"]
+CMD gunicorn --workers 1 --threads 8 --timeout 600 --bind 0.0.0.0:${PORT:-8080} app:app
