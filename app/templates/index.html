@@ -357,7 +357,7 @@
       // Start the job
       let jobId;
       try {
-        const res  = await fetch("/api/start", {
+        const res  = await fetch("/api/v1/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url, pdf_name: pdfName }),
@@ -378,7 +378,7 @@
       }
 
       // Stream progress
-      eventSource = new EventSource(`/api/stream/${jobId}`);
+      eventSource = new EventSource(`/api/v1/stream/${jobId}`);
 
       eventSource.onmessage = (e) => {
         const msg = JSON.parse(e.data);
@@ -390,7 +390,7 @@
           if (msg.status === "done") {
             setStatus("done");
             appendLog("\n✅  All done! Click the button below to save your PDF.");
-            downloadLink.href = `/api/download`;
+            downloadLink.href = `/api/v1/download`;
             downloadLink.setAttribute("download", msg.pdf);
             downloadArea.classList.remove("hidden");
           } else {

@@ -1,36 +1,89 @@
+import sys
+import io
 import os
-import time
+import queue
 import shutil
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
 import requests
 from PIL import Image
-from io import BytesIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-URL            = "https://weebcentral.com/chapters/01J76XYYRGE0WYTVGY7MGJ6VGW"
-OUTPUT_DIR     = "manga_pages"
-PDF_OUTPUT     = "chapter.pdf"
-SCROLL_PAUSE   = 0.2   # seconds between scroll steps (reduced from 0.4)
-DOWNLOAD_WORKERS = 8   # parallel download threads
-# ─────────────────────────────────────────────────────────────────────────────
+from app.core.config import settings
 
-def collect_image_urls(driver):
+# ─── Job state ────────────────────────────────────────────────────────────────
+
+_job_lock = threading.Lock()
+_current_job: Optional[dict] = None
+
+
+# ─── Queue writer ─────────────────────────────────────────────────────────────
+
+class QueueWriter(io.TextIOBase):
+    """Captures print() calls from a worker thread and feeds them into a Queue.
+
+    Lines ending with \\r are flagged as in-place updates (progress bars) so
+    the frontend can overwrite the last log line instead of appending a new one.
+    """
+
+    def __init__(self, q: queue.Queue):
+        self._q = q
+        self._buf = ""
+
+    def write(self, s: str) -> int:
+        for char in s:
+            if char == "\n":
+                if self._buf.strip():
+                    self._q.put({"text": self._buf, "cr": False})
+                self._buf = ""
+            elif char == "\r":
+                if self._buf.strip():
+                    self._q.put({"text": self._buf, "cr": True})
+                self._buf = ""
+            else:
+                self._buf += char
+        return len(s)
+
+    def flush(self):
+        if self._buf.strip():
+            self._q.put({"text": self._buf, "cr": False})
+            self._buf = ""
+
+    def readable(self):
+        return False
+
+    def writable(self):
+        return True
+
+
+# ─── Scraping helpers ─────────────────────────────────────────────────────────
+
+def _fmt_bytes(n):
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _collect_image_urls(driver):
     """Return all manga-page image URLs found in the DOM (handles lazy-load)."""
     img_elements = driver.find_elements(By.TAG_NAME, "img")
     urls = []
     seen = set()
     for el in img_elements:
-        # try every attribute that lazy-load libraries use
         for attr in ("src", "data-src", "data-lazy-src", "data-original",
                      "data-url", "data-image", "srcset"):
             val = el.get_attribute(attr) or ""
-            # srcset can contain multiple entries; take the last (highest res)
             if attr == "srcset" and val:
                 val = val.strip().split()[-2] if len(val.strip().split()) >= 2 else val.strip().split()[0]
             val = val.strip()
@@ -41,15 +94,7 @@ def collect_image_urls(driver):
     return urls
 
 
-def _fmt_bytes(n):
-    for unit in ("B", "KB", "MB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GB"
-
-
-def scroll_and_collect(driver):
+def _scroll_and_collect(driver):
     """Slowly scroll the whole page so lazy-loaded images get their src set."""
     last_height = driver.execute_script("return document.body.scrollHeight")
     collected: set[str] = set()
@@ -58,7 +103,7 @@ def scroll_and_collect(driver):
     driver.execute_script("window.scrollTo(0, 0);")
     time.sleep(1)
 
-    step = 4000  # pixels per scroll step
+    step = 4000
     current_pos = 0
 
     print(f"  📐  Page height: {last_height}px — scrolling in {step}px steps")
@@ -66,9 +111,9 @@ def scroll_and_collect(driver):
     while True:
         current_pos += step
         driver.execute_script(f"window.scrollTo(0, {current_pos});")
-        time.sleep(SCROLL_PAUSE)
+        time.sleep(settings.scroll_pause)
 
-        for url in collect_image_urls(driver):
+        for url in _collect_image_urls(driver):
             collected.add(url)
 
         new_height = driver.execute_script("return document.body.scrollHeight")
@@ -81,23 +126,20 @@ def scroll_and_collect(driver):
             print(f"  ⏩  [{pct:3d}%] pos={current_pos}px", end="\r")
 
         if current_pos >= new_height:
-            # one final pass at the very bottom
             print(f"\n  🏁  Reached bottom ({new_height}px) — doing final pass…")
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)
-            for url in collect_image_urls(driver):
+            for url in _collect_image_urls(driver):
                 collected.add(url)
             break
         last_height = new_height
 
-    # preserve DOM order
     ordered = []
     seen = set()
-    for url in collect_image_urls(driver):
+    for url in _collect_image_urls(driver):
         if url not in seen:
             ordered.append(url)
             seen.add(url)
-    # add any that were collected mid-scroll but are no longer in DOM
     extra = 0
     for url in collected:
         if url not in seen:
@@ -108,7 +150,7 @@ def scroll_and_collect(driver):
     return ordered
 
 
-def download_image(url, referer, session):
+def _download_image(url, referer, session):
     headers = {
         "Referer": referer,
         "User-Agent": (
@@ -123,7 +165,7 @@ def download_image(url, referer, session):
     return resp.content, len(resp.content)
 
 
-def images_to_pdf(image_paths, output_path):
+def _images_to_pdf(image_paths, output_path):
     print(f"\n📄  Building PDF from {len(image_paths)} image(s)…")
     pages = []
     for i, path in enumerate(image_paths, 1):
@@ -133,7 +175,7 @@ def images_to_pdf(image_paths, output_path):
     if not pages:
         print("❌  No images to convert.")
         return
-    print(f"  💾  Writing PDF…")
+    print("  💾  Writing PDF…")
     pages[0].save(
         output_path,
         save_all=True,
@@ -144,8 +186,9 @@ def images_to_pdf(image_paths, output_path):
     print(f"\n✅  PDF saved → {output_path}  ({len(pages)} pages, {_fmt_bytes(size)})")
 
 
-# ─── MAIN LOGIC ──────────────────────────────────────────────────────────────
-def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
+# ─── Main pipeline ────────────────────────────────────────────────────────────
+
+def run(url, output_dir, pdf_output):
     """Run the full manga-to-PDF pipeline. All output goes to sys.stdout."""
     start_time = time.time()
     print("╔══════════════════════════════════════════╗")
@@ -156,7 +199,6 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
     print(f"📄  PDF output : {pdf_output}")
     print()
 
-    # clean output dir
     if os.path.exists(output_dir):
         print(f"🗑   Cleaning old output dir '{output_dir}'…")
         shutil.rmtree(output_dir)
@@ -164,7 +206,6 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
     print(f"📂  Created output dir '{output_dir}'")
     print()
 
-    # launch headless Chrome
     print("🚀  Launching headless Chrome…")
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
@@ -195,7 +236,7 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
     print()
 
     print("📜  Scrolling page to trigger lazy-load…")
-    img_urls = scroll_and_collect(driver)
+    img_urls = _scroll_and_collect(driver)
     driver.quit()
     print("✅  Browser closed")
     print()
@@ -209,17 +250,16 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
         print("❌  No images found. The site structure may have changed.")
         return
 
-    # parallel download
-    print(f"⬇️   Downloading {len(img_urls)} image(s) with {DOWNLOAD_WORKERS} parallel workers…")
+    print(f"⬇️   Downloading {len(img_urls)} image(s) with {settings.download_workers} parallel workers…")
     session = requests.Session()
-    results = {}   # index → path
+    results = {}
     total_bytes = 0
     skipped = 0
 
     def _fetch(idx_url):
         idx, img_url = idx_url
-        data, size = download_image(img_url, referer=url, session=session)
-        img = Image.open(BytesIO(data))
+        data, size = _download_image(img_url, referer=url, session=session)
+        img = Image.open(io.BytesIO(data))
         img.verify()
         ext = img.format.lower() if img.format else "jpg"
         path = os.path.join(output_dir, f"{idx:04d}.{ext}")
@@ -227,7 +267,7 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
             f.write(data)
         return idx, path, size
 
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=settings.download_workers) as pool:
         futures = {pool.submit(_fetch, (i, u)): i for i, u in enumerate(img_urls)}
         for fut in as_completed(futures):
             i = futures[fut]
@@ -242,25 +282,63 @@ def run(url, output_dir=OUTPUT_DIR, pdf_output=PDF_OUTPUT):
                 done = len(results) + skipped
                 print(f"  ⚠️   Skipped [{done}/{len(img_urls)}] #{i}  ({e})")
 
-    # restore page order
     saved_files = [results[k] for k in sorted(results)]
-
     elapsed = time.time() - start_time
     print(f"\n✅  Downloaded {len(saved_files)}/{len(img_urls)} page(s)  — {_fmt_bytes(total_bytes)} total")
     print(f"⏱   Time so far: {elapsed:.1f}s")
 
-    # build PDF
     if saved_files:
-        images_to_pdf(saved_files, pdf_output)
+        _images_to_pdf(saved_files, pdf_output)
         elapsed = time.time() - start_time
         print(f"⏱   Total time : {elapsed:.1f}s")
 
-    # clean up temp image directory
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
         print(f"🗑   Removed temp dir '{output_dir}'")
 
 
-# ─── CLI ENTRY POINT ─────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    run(URL, OUTPUT_DIR, PDF_OUTPUT)
+# ─── Job management ───────────────────────────────────────────────────────────
+
+def start_pdf_job(url: str, pdf_name: str) -> Optional[str]:
+    """Start a background PDF generation job. Returns job_id, or None if busy."""
+    global _current_job
+
+    if not _job_lock.acquire(blocking=False):
+        return None
+
+    q: queue.Queue = queue.Queue()
+    job_id = str(int(time.time() * 1000))
+    tmp_dir = os.path.join(tempfile.gettempdir(), f"manga_{job_id}")
+    pdf_path = os.path.join(tempfile.gettempdir(), pdf_name)
+    _current_job = {
+        "id": job_id,
+        "queue": q,
+        "pdf": pdf_name,
+        "pdf_path": pdf_path,
+        "status": "running",
+    }
+
+    def worker():
+        global _current_job
+        old_stdout = sys.stdout
+        sys.stdout = QueueWriter(q)
+        try:
+            run(url, output_dir=tmp_dir, pdf_output=pdf_path)
+            _current_job["status"] = "done"
+        except Exception as exc:
+            print(f"❌  Fatal error: {exc}")
+            _current_job["status"] = "error"
+        finally:
+            if hasattr(sys.stdout, "flush"):
+                sys.stdout.flush()
+            sys.stdout = old_stdout
+            q.put(None)  # sentinel — signals stream end
+            _job_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return job_id
+
+
+def get_current_job() -> Optional[dict]:
+    """Return the current job dict, or None if no job has been started."""
+    return _current_job

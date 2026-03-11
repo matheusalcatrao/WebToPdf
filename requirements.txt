@@ -1,6 +1,10 @@
-flask
+fastapi
+uvicorn[standard]
 gunicorn
+jinja2
 selenium
 webdriver-manager
 Pillow
 requests
+pytest
+httpx
