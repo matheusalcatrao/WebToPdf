@@ -8,9 +8,13 @@ import os
 import tempfile
 from typing import Optional
 
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context, send_file
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.responses import JSONResponse, StreamingResponse, FileResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
-app = Flask(__name__)
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
 # Only one job at a time
 _job_lock = threading.Lock()
@@ -54,28 +58,34 @@ class QueueWriter(io.TextIOBase):
         return True
 
 
+# ─── Request model ────────────────────────────────────────────────────────────
+
+class StartJobRequest(BaseModel):
+    url: str
+    pdf_name: str = "chapter.pdf"
+
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+@app.get("/")
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
-@app.route("/api/start", methods=["POST"])
-def start_job():
+@app.post("/api/start")
+def start_job(body: StartJobRequest):
     global _current_job
 
-    data = request.get_json(force=True)
-    url = (data.get("url") or "").strip()
-    pdf_name = (data.get("pdf_name") or "chapter.pdf").strip()
+    url = body.url.strip()
+    pdf_name = body.pdf_name.strip()
 
     if not url:
-        return jsonify({"error": "URL is required"}), 400
+        return JSONResponse({"error": "URL is required"}, status_code=400)
     if not pdf_name.endswith(".pdf"):
         pdf_name += ".pdf"
 
     if not _job_lock.acquire(blocking=False):
-        return jsonify({"error": "A download is already running. Please wait."}), 429
+        return JSONResponse({"error": "A download is already running. Please wait."}, status_code=429)
 
     q: queue.Queue = queue.Queue()
     job_id = str(int(time.time() * 1000))
@@ -104,15 +114,15 @@ def start_job():
             _job_lock.release()
 
     threading.Thread(target=worker, daemon=True).start()
-    return jsonify({"job_id": job_id})
+    return {"job_id": job_id}
 
 
-@app.route("/api/stream/<job_id>")
+@app.get("/api/stream/{job_id}")
 def stream(job_id: str):
     global _current_job
 
     if not _current_job or _current_job["id"] != job_id:
-        return jsonify({"error": "Job not found"}), 404
+        raise HTTPException(status_code=404, detail="Job not found")
 
     q = _current_job["queue"]
 
@@ -133,37 +143,35 @@ def stream(job_id: str):
 
             yield f"data: {json.dumps({'type': 'log', 'message': msg['text'], 'cr': msg['cr']})}\n\n"
 
-    return Response(
-        stream_with_context(generate()),
-        content_type="text/event-stream",
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@app.route("/api/download")
-def download():
+@app.get("/api/download")
+def download(background_tasks: BackgroundTasks):
     if not _current_job or not _current_job.get("pdf_path"):
-        return jsonify({"error": "No file available"}), 404
+        raise HTTPException(status_code=404, detail="No file available")
     filepath = _current_job["pdf_path"]
     pdf_name = _current_job["pdf"]
     if not os.path.exists(filepath):
-        return jsonify({"error": "File not found — it may have already been downloaded"}), 404
+        raise HTTPException(status_code=404, detail="File not found — it may have already been downloaded")
 
-    from flask import after_this_request
-
-    @after_this_request
-    def _cleanup(response):
+    def cleanup():
         try:
             os.remove(filepath)
         except Exception:
             pass
-        return response
 
-    return send_file(filepath, as_attachment=True, download_name=pdf_name)
+    background_tasks.add_task(cleanup)
+    return FileResponse(filepath, filename=pdf_name, media_type="application/pdf")
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 5001))
-    app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
+    uvicorn.run(app, host="0.0.0.0", port=port)

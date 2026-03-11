@@ -39,5 +39,7 @@ ENV WDM_CACHE_PATH=/tmp/.wdm
 
 EXPOSE 8080
 
-# 1 process · 8 threads · 10-min timeout (scraping can be slow)
-CMD gunicorn --workers 1 --threads 8 --timeout 600 --bind 0.0.0.0:${PORT:-8080} app:app
+# 1 process · uvicorn worker · 10-min timeout (scraping can be slow)
+# Single worker is intentional: in-process job lock (_job_lock) enforces
+# one-at-a-time semantics; multiple workers would bypass it across processes.
+CMD gunicorn --workers 1 --worker-class uvicorn.workers.UvicornWorker --timeout 600 --bind 0.0.0.0:${PORT:-8080} app:app
