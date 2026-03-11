@@ -6,3 +6,5 @@ selenium
 webdriver-manager
 Pillow
 requests
+pytest
+httpx
