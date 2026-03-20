@@ -25,6 +25,10 @@ app.add_middleware(
 
 app.include_router(api_v1_router, prefix="/api/v1")
 
+@app.get("/")
+def healthcheck():
+    return JSONResponse({"status": "ok"})
+
 if __name__ == "__main__":
     import uvicorn
     from app.core.config import settings
