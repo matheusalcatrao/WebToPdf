@@ -5,3 +5,4 @@ __pycache__/
 manga_pages/
 .DS_Store
 .wdm/
+.pytest_cache/
