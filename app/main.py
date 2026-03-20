@@ -3,7 +3,7 @@ import os
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import JSONResponse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,9 +25,11 @@ app.add_middleware(
 
 app.include_router(api_v1_router, prefix="/api/v1")
 
+
 @app.get("/")
 def healthcheck():
     return JSONResponse({"status": "ok"})
+
 
 if __name__ == "__main__":
     import uvicorn
